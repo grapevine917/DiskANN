@@ -33,6 +33,13 @@ struct QueryStats
     unsigned n_cmps = 0;       // # cmps
     unsigned n_cache_hits = 0; // # cache_hits
     unsigned n_hops = 0;       // # search hops
+    unsigned n_expanded = 0;
+    unsigned n_deferred = 0;
+    unsigned n_rescued = 0;
+    unsigned n_gate_evaluated = 0;
+    unsigned n_gate_skipped = 0;
+    unsigned n_et_evaluated = 0;
+    unsigned n_et_stopped = 0;
 };
 
 template <typename T>

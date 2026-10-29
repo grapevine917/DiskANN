@@ -7,6 +7,10 @@
 #include "pq.h"
 #include "pq_scratch.h"
 #include "pq_flash_index.h"
+#include "gate_trace.h"
+#include "online_gate.h"
+#include "ram_entry.h"
+#include "online_termination.h"
 #include "cosine_similarity.h"
 
 #ifdef _WINDOWS
@@ -1399,10 +1403,24 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     compute_dists(&best_medoid, 1, dist_scratch);
     retset.insert(Neighbor(best_medoid, dist_scratch[0]));
     visited.insert(best_medoid);
+    if(ram_entry_seeds) for(uint32_t seed:*ram_entry_seeds) {
+        if(seed>=_num_points)throw std::runtime_error("Invalid RAM entry seed");
+        if(visited.insert(seed).second) {
+            compute_dists(&seed,1,dist_scratch);
+            retset.insert(Neighbor(seed,dist_scratch[0]));
+        }
+    }
 
     uint32_t cmps = 0;
     uint32_t hops = 0;
     uint32_t num_ios = 0;
+    uint32_t completed_expansions = 0;
+    OnlineHistory online_history;
+    struct DeferredCandidate { Neighbor candidate; size_t rank; float retain_score; };
+    std::vector<DeferredCandidate> deferred_nodes;
+    uint32_t deferred_rescued=0;
+    bool defer_rescue=false;
+    float online_best_exact = std::numeric_limits<float>::infinity();
 
     // cleared every iteration
     std::vector<uint32_t> frontier;
@@ -1414,8 +1432,34 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     std::vector<std::pair<uint32_t, std::pair<uint32_t, uint32_t *>>> cached_nhoods;
     cached_nhoods.reserve(2 * beam_width);
 
-    while (retset.has_unexpanded_node() && num_ios < io_limit)
+    auto rescue_available=[&]() { return online_defer_limit && !deferred_nodes.empty() && deferred_rescued<online_defer_limit; };
+    while ((retset.has_unexpanded_node() || rescue_available()) && num_ios < io_limit)
     {
+        if(!retset.has_unexpanded_node() && rescue_available()) defer_rescue=true;
+        // Entire-search stop decision, before selecting or submitting a new beam.
+        // At least K exact-scored candidates are required for a valid top-K result.
+        if((online_termination || termination_trace) && retset.has_unexpanded_node() && full_retset.size()>=k_search) {
+            size_t rank=0, unexpanded=0; bool found=false;
+            for(size_t j=0;j<retset.size();++j) if(!retset[j].expanded) {
+                ++unexpanded; if(!found){rank=j;found=true;}
+            }
+            const auto& next=retset[rank];
+            const float best=retset[0].distance,worst=retset[retset.size()-1].distance;
+            std::array<float,17> state={{next.distance,best,worst,float(rank),float(retset.size()),
+                float(unexpanded),float(visited.size()),float(completed_expansions),float(hops),
+                0.0f,float(_nhood_cache.count(next.id)!=0),online_best_exact,1.0f,
+                float(double(next.distance)/std::max(double(best),1e-12)),
+                float(double(next.distance)/std::max(double(worst),1e-12)),float(l_search),float(beam_width)}};
+            const float score=online_termination?online_termination->score(query_float,next.id,state.data()):-1.0f;
+            if(termination_trace) termination_trace->boundaries.push_back({next.id,completed_expansions,state,score});
+            if(online_termination) {
+                if(stats) ++stats->n_et_evaluated;
+                if(score>=online_termination->threshold) {
+                    if(stats) ++stats->n_et_stopped;
+                    break;
+                }
+            }
+        }
         // clear iteration state
         frontier.clear();
         frontier_nhoods.clear();
@@ -1424,10 +1468,104 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         sector_scratch_idx = 0;
         // find new beam
         uint32_t num_seen = 0;
-        while (retset.has_unexpanded_node() && frontier.size() < beam_width && num_seen < beam_width)
+        while ((retset.has_unexpanded_node() || (defer_rescue && rescue_available())) && frontier.size() < beam_width && num_seen < beam_width)
         {
-            auto nbr = retset.closest_unexpanded();
+            // Reuse a historical skip before state extraction or model inference.
+            bool memo_candidate=false;
+            if(online_skip_memo && retset.has_unexpanded_node()) {
+                for(size_t j=0;j<retset.size();++j)if(!retset[j].expanded) {
+                    const auto& next=retset[j];
+                    if(!_nhood_cache.count(next.id))memo_candidate=online_skip_memo->matches(next.id,uint32_t(j),completed_expansions);
+                    break;
+                }
+                if(memo_candidate && !online_skip_memo->lookup_only && !online_skip_memo->audit) {
+                    retset.closest_unexpanded();++num_seen;
+                    ++online_skip_memo->reused;
+                    if(stats){++stats->n_gate_evaluated;++stats->n_gate_skipped;}
+                    continue;
+                }
+            }
+            // State is captured before marking this beam candidate expanded.
+            size_t candidate_rank=0, unexpanded_count=0;
+            if ((online_gate && !defer_rescue) || online_heuristic) {
+                bool found=false;
+                for(size_t j=0;j<retset.size();++j) if(!retset[j].expanded) {
+                    ++unexpanded_count;
+                    if(!found){candidate_rank=j;found=true;}
+                    if(online_heuristic && !online_audit) break;
+                }
+            }
+            Neighbor nbr;
+            if(retset.has_unexpanded_node()) nbr=retset.closest_unexpanded();
+            else {
+                auto next=std::min_element(deferred_nodes.begin(),deferred_nodes.end(),[](const DeferredCandidate&a,const DeferredCandidate&b){
+                    if(online_defer_priority==1 && a.retain_score!=b.retain_score)return a.retain_score>b.retain_score;
+                    if(online_defer_priority==2 && a.rank!=b.rank)return a.rank<b.rank;
+                    return a.candidate<b.candidate;
+                });
+                nbr=next->candidate;deferred_nodes.erase(next);++deferred_rescued;
+                if(stats)++stats->n_rescued;
+            }
             num_seen++;
+            if(online_node_marks) {
+                if(stats)++stats->n_gate_evaluated;
+                if(online_node_marks->contains(nbr.id) && !_nhood_cache.count(nbr.id)) {
+                    if(stats)++stats->n_gate_skipped;
+                    continue;
+                }
+            }
+            if((online_gate && !defer_rescue) || online_heuristic) {
+                const bool heuristic_skip=online_heuristic && online_heuristic->skip(candidate_rank,completed_expansions);
+                bool joint_skip=false;
+                if(online_gate || online_audit) {
+                const float best=retset[0].distance, worst=retset[retset.size()-1].distance;
+                // Explicit flag: -Ofast may fold isfinite(infinity) to true.
+                const bool has_exact=completed_expansions>0;
+                float state[44]={nbr.distance,best,worst,float(candidate_rank),float(retset.size()),
+                    float(unexpanded_count),float(visited.size()),float(completed_expansions),float(hops),
+                    float(num_seen-1),float(_nhood_cache.count(nbr.id)!=0),has_exact?online_best_exact:0.0f,
+                    float(has_exact),float(double(nbr.distance)/std::max(double(best),1e-12)),
+                    float(double(nbr.distance)/std::max(double(worst),1e-12)),float(l_search),float(beam_width)};
+                online_history.features(state,state+17);
+                if(online_model_calls && online_gate && state[10]==0)++*online_model_calls;
+                online_last_score=(online_miss_only && state[10]!=0)?1.0f:(online_gate?online_gate->score(query_float,nbr.id,state):float(!heuristic_skip));
+                if(memo_candidate && online_skip_memo->audit && !online_skip_memo->lookup_only) {
+                    ++online_skip_memo->reused;
+                    if(online_last_score>=online_gate->threshold)++online_skip_memo->conflicts;
+                    online_last_score=-1.0f;
+                }
+                if(online_joint_gate && !(online_miss_only && state[10]!=0)) {
+                    if(online_model_calls && state[10]==0)++*online_model_calls;
+                    joint_skip=online_joint_gate->score(query_float,nbr.id,state)<online_joint_gate->threshold;
+                }
+                if(online_audit) {
+                    online_audit->push_back(float(nbr.id));
+                    online_audit->insert(online_audit->end(),state,state+17);
+                    online_audit->push_back(online_last_score);
+                }
+                const bool decision=((online_gate ? online_last_score < online_gate->threshold : heuristic_skip) || joint_skip) && !(online_protect && online_protect->count(nbr.id)) && !(online_miss_only && _nhood_cache.count(nbr.id));
+                if(online_history_audit) {
+                    online_history_audit->push_back(float(nbr.id));
+                    online_history_audit->insert(online_history_audit->end(),state,state+44);
+                    online_history_audit->push_back(float(decision));
+                }
+                online_history.update(state,decision || (gate_skip_entire_node && gate_should_skip(nbr.id)));
+                }
+                if(stats) ++stats->n_gate_evaluated;
+                const bool history_skip=((online_gate ? online_last_score < online_gate->threshold : heuristic_skip) || joint_skip) && !(online_protect && online_protect->count(nbr.id)) && !(online_miss_only && _nhood_cache.count(nbr.id));
+                // State is local to the scoring block; reconstruct history update via an explicit copy.
+                if(history_skip) {
+                    if(stats) ++stats->n_gate_skipped;
+                    if(online_skip_records && !_nhood_cache.count(nbr.id))online_skip_records->push_back({nbr.id,uint32_t(candidate_rank),completed_expansions});
+                    if(online_defer_limit) {
+                        deferred_nodes.push_back({nbr,candidate_rank,online_last_score});
+                        if(stats)++stats->n_deferred;
+                    }
+                    continue; // consumes the original beam slot; no SSD fetch or exact scoring
+                }
+            }
+            // Hindsight masks must exclude final top-k nodes when skipping their exact scoring.
+            if (gate_skip_entire_node && gate_should_skip(nbr.id)) continue;
             auto iter = _nhood_cache.find(nbr.id);
             if (iter != _nhood_cache.end())
             {
@@ -1501,9 +1639,22 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                         query_float, (uint8_t *)node_fp_coords_copy);
             }
             full_retset.push_back(Neighbor((uint32_t)cached_nhood.first, cur_expanded_dist));
+            if(termination_trace) termination_trace->scored_nodes.push_back(cached_nhood.first);
+            ++completed_expansions;
+            online_best_exact=std::min(online_best_exact,cur_expanded_dist);
+            if(stats) ++stats->n_expanded;
 
             uint64_t nnbrs = cached_nhood.second.first;
             uint32_t *node_nbrs = cached_nhood.second.second;
+
+            float gate_current_pq = std::numeric_limits<float>::quiet_NaN();
+            if (gate_trace && gate_trace->v2) {
+                uint32_t gate_node = cached_nhood.first;
+                compute_dists(&gate_node, 1, dist_scratch);
+                gate_current_pq = dist_scratch[0];
+            }
+            gate_begin(cached_nhood.first, nnbrs, cur_expanded_dist, true, gate_current_pq, hops);
+            if (gate_should_skip(cached_nhood.first)) continue;
 
             // compute node_nbrs <-> query dists in PQ space
             cpu_timer.reset();
@@ -1514,11 +1665,19 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 stats->cpu_us += (float)cpu_timer.elapsed();
             }
 
+            auto gate_ranks = gate_neighbor_ranks(node_nbrs, dist_scratch, nnbrs);
             // process prefetched nhood
             for (uint64_t m = 0; m < nnbrs; ++m)
             {
                 uint32_t id = node_nbrs[m];
-                if (visited.insert(id).second)
+                uint32_t gate_visited_before = uint32_t(visited.size());
+                uint32_t gate_queue_size = uint32_t(retset.size());
+                float gate_best_pq = retset[0].distance;
+                uint32_t gate_rank = gate_ranks.empty() ? 0 : gate_ranks[m];
+                bool gate_fresh = visited.insert(id).second;
+                if (!gate_fresh) gate_edge(id, dist_scratch[m], false, false, gate_rank,
+                                          uint32_t(m), gate_queue_size, gate_visited_before, gate_best_pq);
+                if (gate_fresh)
                 {
                     if (!use_filter && _dummy_pts.find(id) != _dummy_pts.end())
                         continue;
@@ -1529,6 +1688,9 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                     cmps++;
                     float dist = dist_scratch[m];
                     Neighbor nn(id, dist);
+                    bool gate_admitted = retset.size() < retset.capacity() || !(retset[retset.size()-1] < nn);
+                    gate_edge(id, dist, true, gate_admitted, gate_rank, uint32_t(m),
+                              gate_queue_size, gate_visited_before, gate_best_pq);
                     retset.insert(nn);
                 }
             }
@@ -1566,7 +1728,20 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                     cur_expanded_dist = _disk_pq_table.l2_distance(query_float, (uint8_t *)data_buf);
             }
             full_retset.push_back(Neighbor(frontier_nhood.first, cur_expanded_dist));
+            if(termination_trace) termination_trace->scored_nodes.push_back(frontier_nhood.first);
+            ++completed_expansions;
+            online_best_exact=std::min(online_best_exact,cur_expanded_dist);
+            if(stats) ++stats->n_expanded;
             uint32_t *node_nbrs = (node_buf + 1);
+            float gate_current_pq = std::numeric_limits<float>::quiet_NaN();
+            if (gate_trace && gate_trace->v2) {
+                uint32_t gate_node = frontier_nhood.first;
+                compute_dists(&gate_node, 1, dist_scratch);
+                gate_current_pq = dist_scratch[0];
+            }
+            gate_begin(frontier_nhood.first, nnbrs, cur_expanded_dist, false, gate_current_pq, hops);
+            if (gate_should_skip(frontier_nhood.first)) continue;
+
             // compute node_nbrs <-> query dist in PQ space
             cpu_timer.reset();
             compute_dists(node_nbrs, nnbrs, dist_scratch);
@@ -1577,11 +1752,19 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             }
 
             cpu_timer.reset();
+            auto gate_ranks = gate_neighbor_ranks(node_nbrs, dist_scratch, nnbrs);
             // process prefetch-ed nhood
             for (uint64_t m = 0; m < nnbrs; ++m)
             {
                 uint32_t id = node_nbrs[m];
-                if (visited.insert(id).second)
+                uint32_t gate_visited_before = uint32_t(visited.size());
+                uint32_t gate_queue_size = uint32_t(retset.size());
+                float gate_best_pq = retset[0].distance;
+                uint32_t gate_rank = gate_ranks.empty() ? 0 : gate_ranks[m];
+                bool gate_fresh = visited.insert(id).second;
+                if (!gate_fresh) gate_edge(id, dist_scratch[m], false, false, gate_rank,
+                                          uint32_t(m), gate_queue_size, gate_visited_before, gate_best_pq);
+                if (gate_fresh)
                 {
                     if (!use_filter && _dummy_pts.find(id) != _dummy_pts.end())
                         continue;
@@ -1597,6 +1780,9 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                     }
 
                     Neighbor nn(id, dist);
+                    bool gate_admitted = retset.size() < retset.capacity() || !(retset[retset.size()-1] < nn);
+                    gate_edge(id, dist, true, gate_admitted, gate_rank, uint32_t(m),
+                              gate_queue_size, gate_visited_before, gate_best_pq);
                     retset.insert(nn);
                 }
             }
@@ -1609,6 +1795,8 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
 
         hops++;
     }
+
+    if (gate_trace) gate_trace->visited = uint32_t(visited.size());
 
     // re-sort by distance
     std::sort(full_retset.begin(), full_retset.end());
@@ -1666,6 +1854,11 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     // copy k_search values
     for (uint64_t i = 0; i < k_search; i++)
     {
+        if(i>=full_retset.size()) {
+            indices[i]=std::numeric_limits<uint32_t>::max();
+            if(distances) distances[i]=std::numeric_limits<float>::infinity();
+            continue;
+        }
         indices[i] = full_retset[i].id;
         auto key = (uint32_t)indices[i];
         if (_dummy_pts.find(key) != _dummy_pts.end())

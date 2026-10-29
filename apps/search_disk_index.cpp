@@ -10,6 +10,10 @@
 #include "memory_mapper.h"
 #include "partition.h"
 #include "pq_flash_index.h"
+#include "gate_trace.h"
+#include "online_gate.h"
+#include "decision_trace.h"
+#include "online_termination.h"
 #include "timer.h"
 #include "percentile_stats.h"
 #include "program_options_utils.hpp"
@@ -47,7 +51,7 @@ void print_stats(std::string category, std::vector<float> percentiles, std::vect
     diskann::cout << std::endl;
 }
 
-template <typename T, typename LabelT = uint32_t>
+template <typename T, typename LabelT = uint32_t, bool DecisionTraceEnabled = false>
 int search_disk_index(diskann::Metric &metric, const std::string &index_path_prefix,
                       const std::string &result_output_prefix, const std::string &query_file, std::string &gt_file,
                       const uint32_t num_threads, const uint32_t recall_at, const uint32_t beamwidth,
@@ -126,6 +130,53 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
     //     _pFlashIndex->generate_cache_list_from_sample_queries(warmup_query_file, 15, 6, num_nodes_to_cache,
     //     num_threads, node_list);
     _pFlashIndex->load_cache_list(node_list);
+    std::unique_ptr<diskann::OnlineGate> learned_gate;
+    std::unique_ptr<diskann::OnlineGate> joint_gate;
+    std::unique_ptr<diskann::OnlineHeuristic> heuristic_gate;
+    std::unique_ptr<diskann::OnlineGate> termination_gate;
+    std::unique_ptr<diskann::OnlineNodeMarks> node_marks;
+    if(const char* model=std::getenv("DISKANN_M3_MODEL")) {
+        const char* base=std::getenv("DISKANN_M3_BASE");
+        const char* tau=std::getenv("DISKANN_M3_TAU");
+        if(!tau || metric!=diskann::Metric::L2 || filtered_search)
+            throw std::runtime_error("Learned pruning requires unfiltered L2 and model/tau");
+        learned_gate.reset(new diskann::OnlineGate(model,base?base:"",std::stof(tau)));
+        if(learned_gate->query_feature_width()!=0 && learned_gate->query_feature_width()!=query_dim)
+            throw std::runtime_error("Classifier query dimension mismatch");
+        if(learned_gate->uses_vector_features() && query_dim!=128)
+            throw std::runtime_error("Vector-feature M3 requires 128d SIFT queries");
+    }
+    if(const char* model=std::getenv("DISKANN_JOINT_MODEL")) {
+        const char* tau=std::getenv("DISKANN_JOINT_TAU");
+        if(!learned_gate || !tau) throw std::runtime_error("Joint pruning requires primary gate and second threshold");
+        joint_gate.reset(new diskann::OnlineGate(model,"",std::stof(tau)));
+        if(joint_gate->uses_vector_features() || joint_gate->query_feature_width()!=0)
+            throw std::runtime_error("Joint gate requires state-only features");
+    }
+    if(const char* rank=std::getenv("DISKANN_HEURISTIC_R")) {
+        const char* expansions=std::getenv("DISKANN_HEURISTIC_E");
+        if(learned_gate || filtered_search || use_reorder_data)
+            throw std::runtime_error("Heuristic baseline requires unfiltered search without another gate or reorder");
+        heuristic_gate.reset(new diskann::OnlineHeuristic{std::stoi(rank),expansions?std::stoi(expansions):-1});
+    }
+    if(const char* model=std::getenv("DISKANN_ET_MODEL")) {
+        const char* tau=std::getenv("DISKANN_ET_TAU");
+        if(!tau || heuristic_gate || filtered_search || use_reorder_data || metric!=diskann::Metric::L2)
+            throw std::runtime_error("ET requires unfiltered L2 and a safe-stop threshold; learned pruning is supported");
+        termination_gate.reset(new diskann::OnlineGate(model,"",std::stof(tau)));
+        if(termination_gate->uses_vector_features())
+            throw std::runtime_error("ET requires a state-only safe-stop model");
+    }
+    if(const char* path=std::getenv("DISKANN_NODE_MARKS")) {
+        if(learned_gate || joint_gate || heuristic_gate || termination_gate || filtered_search || use_reorder_data || metric!=diskann::Metric::L2)
+            throw std::runtime_error("Node marks require standalone unfiltered L2 search");
+        node_marks.reset(new diskann::OnlineNodeMarks(path, _pFlashIndex->get_num_points()));
+    }
+    std::unique_ptr<decision_trace::Writer> decision_writer;
+    if constexpr (DecisionTraceEnabled) {
+        decision_writer.reset(new decision_trace::Writer(result_output_prefix, query, query_num,
+                                                        query_dim, query_aligned_dim, Lvec));
+    }
     node_list.clear();
     node_list.shrink_to_fit();
 
@@ -219,20 +270,63 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
         query_result_ids[test_id].resize(recall_at * query_num);
         query_result_dists[test_id].resize(recall_at * query_num);
 
+        const char* trace_env = std::getenv("DISKANN_TRACE_PREFIX");
+        const char* mask_env = std::getenv("DISKANN_SKIP_PREFIX");
+        std::string trace_prefix = trace_env ? trace_env : "";
+        std::string mask_prefix = mask_env ? mask_env : "";
+        if (!trace_prefix.empty()) {
+            std::ofstream f(trace_prefix+"_"+std::to_string(L)+".trace",std::ios::binary|std::ios::trunc);
+            if(!f) throw std::runtime_error("Cannot initialize trace");
+            f.write(diskann::gate_v2_requested() ? "LGTRACE2" : "LGTRACE1",8);
+        }
+        if (!trace_prefix.empty() && diskann::gate_v2_requested() &&
+            (filtered_search || !mask_prefix.empty() || metric != diskann::Metric::L2 || use_reorder_data))
+            throw std::runtime_error("Trace v2 requires unfiltered L2 without skip masks or reorder");
+        auto gate_masks = diskann::gate_load_masks(mask_prefix,L,query_num);
         auto stats = new diskann::QueryStats[query_num];
+        const char* et_trace_path=std::getenv("DISKANN_ET_TRACE");
+        if(et_trace_path) {
+            std::ofstream f(et_trace_path,std::ios::binary|std::ios::trunc);
+            if(!f) throw std::runtime_error("Cannot initialize ET trace");
+        }
 
         std::vector<uint64_t> query_result_ids_64(recall_at * query_num);
+        std::vector<std::vector<float>> decision_scores, decision_history;
+        if constexpr (DecisionTraceEnabled) { decision_scores.resize(query_num); decision_history.resize(query_num); }
         auto s = std::chrono::high_resolution_clock::now();
 
 #pragma omp parallel for schedule(dynamic, 1)
         for (int64_t i = 0; i < (int64_t)query_num; i++)
         {
+            diskann::GateTrace trace;
+            trace.query_id = uint32_t(i);
+            trace.v2 = diskann::gate_v2_requested();
+            diskann::gate_trace = trace_prefix.empty() ? nullptr : &trace;
+            diskann::gate_skip = mask_prefix.empty() ? nullptr : &gate_masks[i];
+            diskann::gate_skip_entire_node = std::getenv("DISKANN_SKIP_ENTIRE_NODE") != nullptr;
+            diskann::online_node_marks=node_marks.get();
+            diskann::online_gate=learned_gate.get();
+            diskann::online_joint_gate=joint_gate.get();
+            diskann::online_heuristic=heuristic_gate.get();
+            diskann::online_termination=termination_gate.get();
+            diskann::TerminationTrace et_trace;
+            diskann::termination_trace=et_trace_path?&et_trace:nullptr;
+            mkl_set_num_threads_local(1);
+            std::vector<float> audit;
+            const char* audit_path=std::getenv("DISKANN_M3_AUDIT");
+            diskann::online_audit=(audit_path && i==0)?&audit:nullptr;
+            if constexpr (DecisionTraceEnabled) {
+                diskann::online_audit=&decision_scores[i];
+                diskann::online_history_audit=&decision_history[i];
+            }
             if (!filtered_search)
             {
+                const char* early_budget=std::getenv("DISKANN_EARLY_IO_LIMIT");
+                uint32_t io_limit=early_budget?uint32_t(std::stoul(early_budget)):std::numeric_limits<uint32_t>::max();
                 _pFlashIndex->cached_beam_search(query + (i * query_aligned_dim), recall_at, L,
                                                  query_result_ids_64.data() + (i * recall_at),
                                                  query_result_dists[test_id].data() + (i * recall_at),
-                                                 optimized_beamwidth, use_reorder_data, stats + i);
+                                                 optimized_beamwidth, io_limit, use_reorder_data, stats + i);
             }
             else
             {
@@ -250,8 +344,30 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
                     query_result_dists[test_id].data() + (i * recall_at), optimized_beamwidth, true, label_for_search,
                     use_reorder_data, stats + i);
             }
+            diskann::gate_trace = nullptr;
+            diskann::gate_skip = nullptr;
+            diskann::gate_skip_entire_node = false;
+            diskann::online_node_marks=nullptr;
+            diskann::online_gate=nullptr;
+            diskann::online_joint_gate=nullptr;
+            diskann::online_heuristic=nullptr;
+            diskann::online_termination=nullptr;
+            diskann::termination_trace=nullptr;
+            diskann::online_audit=nullptr;
+            if constexpr (DecisionTraceEnabled) diskann::online_history_audit=nullptr;
+            if(audit_path && i==0) {
+                std::ofstream f(audit_path,std::ios::binary);
+                f.write(reinterpret_cast<const char*>(audit.data()),audit.size()*sizeof(float));
+            }
+            if(et_trace_path) diskann::termination_write(et_trace_path,uint32_t(i),et_trace,
+                query_result_ids_64.data()+i*recall_at,recall_at);
+            if (!trace_prefix.empty()) {
+                diskann::gate_finalize(trace, query_result_ids_64.data() + i*recall_at, recall_at);
+                diskann::gate_write(trace_prefix,uint32_t(i),L,trace);
+            }
         }
         auto e = std::chrono::high_resolution_clock::now();
+        if constexpr (DecisionTraceEnabled) decision_writer->write(L, decision_scores, decision_history);
         std::chrono::duration<double> diff = e - s;
         double qps = (1.0 * query_num) / (1.0 * diff.count());
 
@@ -280,6 +396,17 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
                                                query_result_ids[test_id].data(), recall_at, recall_at);
             best_recall = std::max(recall, best_recall);
         }
+        if(const char* path=std::getenv("DISKANN_QUERY_STATS")) {
+            std::ofstream f(path);
+            f << "query_row,expansions,ssd_reads,latency_us,gate_evaluated,gate_skipped,et_evaluated,et_stopped\n";
+            for(size_t i=0;i<query_num;++i)
+                f << i << ',' << stats[i].n_expanded << ',' << stats[i].n_ios << ',' << stats[i].total_us
+                  << ',' << stats[i].n_gate_evaluated << ',' << stats[i].n_gate_skipped
+                  << ',' << stats[i].n_et_evaluated << ',' << stats[i].n_et_stopped << '\n';
+            diskann::cout << "ONLINE_SUMMARY " << std::setprecision(9) << L << ' ' << qps << ' '
+              << mean_latency << ' ' << mean_ios << ' ' << recall << std::endl;
+            diskann::cout.precision(2);
+        }
 
         diskann::cout << std::setw(6) << L << std::setw(12) << optimized_beamwidth << std::setw(16) << qps
                       << std::setw(16) << mean_latency << std::setw(16) << latency_999 << std::setw(16) << mean_ios
@@ -307,6 +434,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
         diskann::save_bin<float>(cur_result_path, query_result_dists[test_id++].data(), query_num, recall_at);
     }
 
+    if constexpr (DecisionTraceEnabled) decision_writer->manifest(true);
     diskann::aligned_free(query);
     if (warmup != nullptr)
         diskann::aligned_free(warmup);
@@ -352,7 +480,7 @@ int main(int argc, char **argv)
                                        program_options_utils::GROUND_TRUTH_FILE_DESCRIPTION);
         optional_configs.add_options()("beamwidth,W", po::value<uint32_t>(&W)->default_value(2),
                                        program_options_utils::BEAMWIDTH);
-        optional_configs.add_options()("num_nodes_to_cache", po::value<uint32_t>(&num_nodes_to_cache)->default_value(0),
+        optional_configs.add_options()("num_nodes_to_cache", po::value<uint32_t>(&num_nodes_to_cache)->default_value(10000),
                                        program_options_utils::NUMBER_OF_NODES_TO_CACHE);
         optional_configs.add_options()(
             "search_io_limit",
@@ -376,6 +504,13 @@ int main(int argc, char **argv)
                                        po::value<float>(&fail_if_recall_below)->default_value(0.0f),
                                        program_options_utils::FAIL_IF_RECALL_BELOW);
 
+        optional_configs.add_options()
+            ("experiment_mode", po::value<std::string>(&decision_trace::mode)->default_value("search"), "search or decision_trace")
+            ("decision_trace_enabled", po::value<bool>(&decision_trace::enabled)->default_value(true), "Enable passive decision capture in decision_trace mode")
+            ("decision_trace_prefix", po::value<std::string>(&decision_trace::prefix)->default_value(""), "Output prefix; default result_path.decision_trace")
+            ("decision_trace_query_ids", po::value<std::string>(&decision_trace::ids_file)->default_value(""), "Unique uint32 IDs, one per query row (text)")
+            ("decision_trace_overwrite", po::value<bool>(&decision_trace::overwrite)->default_value(false), "Allow replacing trace artifacts");
+
         // Merge required and optional parameters
         desc.add(required_configs).add(optional_configs);
 
@@ -387,6 +522,8 @@ int main(int argc, char **argv)
             return 0;
         }
         po::notify(vm);
+        if(decision_trace::mode!="search" && decision_trace::mode!="decision_trace")
+            throw std::runtime_error("experiment_mode must be search or decision_trace");
         if (vm["use_reorder_data"].as<bool>())
             use_reorder_data = true;
     }
@@ -449,6 +586,19 @@ int main(int argc, char **argv)
 
     try
     {
+        if (decision_trace::active()) {
+            if(data_type!="float" || metric!=diskann::Metric::L2 || !query_filters.empty() || use_reorder_data)
+                throw std::runtime_error("decision_trace requires unfiltered float L2 without reorder");
+            const char *model=std::getenv("DISKANN_M3_MODEL");
+            if(!model)throw std::runtime_error("decision_trace requires current state-only MLP (DISKANN_M3_MODEL)");
+            std::ifstream mf(model,std::ios::binary); char magic[8]{}; mf.read(magic,8);
+            if(!mf || std::string(magic,8)!="STGATE01")throw std::runtime_error("decision_trace supports STGATE01 17D MLP");
+            for(const char *key:{"DISKANN_JOINT_MODEL","DISKANN_ET_MODEL","DISKANN_HEURISTIC_R","DISKANN_NODE_MARKS",
+                                 "DISKANN_SKIP_PREFIX","DISKANN_TRACE_PREFIX","DISKANN_M3_AUDIT","DISKANN_ET_TRACE"})
+                if(std::getenv(key))throw std::runtime_error(std::string("decision_trace conflicts with ")+key);
+            return search_disk_index<float,uint32_t,true>(metric,index_path_prefix,result_path_prefix,query_file,gt_file,
+                num_threads,K,W,num_nodes_to_cache,search_io_limit,Lvec,fail_if_recall_below,query_filters,use_reorder_data);
+        }
         if (!query_filters.empty() && label_type == "ushort")
         {
             if (data_type == std::string("float"))

@@ -44,6 +44,17 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
                                                    const char *pivots_filepath, const char *compressed_filepath);
 #endif
 
+    // RAM-only accessors: never issue reads or allocate duplicate vector storage.
+    const T* cached_coordinates(uint32_t id) const {auto i=_coord_cache.find(id);return i==_coord_cache.end()?nullptr:i->second;}
+    uint32_t cached_slot(uint32_t id) const {auto p=cached_coordinates(id);return p?uint32_t((p-_coord_cache_buf)/_aligned_dim):UINT32_MAX;}
+    uint32_t original_medoid() const {return _medoids[0];}
+    std::pair<uint32_t,const uint32_t*> cached_neighbors(uint32_t id) const {
+        auto i=_nhood_cache.find(id);return i==_nhood_cache.end()?std::pair<uint32_t,const uint32_t*>{0,nullptr}:std::pair<uint32_t,const uint32_t*>{i->second.first,i->second.second};
+    }
+    const void* cached_coordinate_storage() const {return _coord_cache_buf;}
+    const void* cached_adjacency_storage() const {return _nhood_cache_buf;}
+    size_t cache_metadata_object_bytes() const {return sizeof(_coord_cache)+sizeof(_nhood_cache);}
+    uint64_t aligned_dimension() const {return _aligned_dim;}
     DISKANN_DLLEXPORT void load_cache_list(std::vector<uint32_t> &node_list);
 
 #ifdef EXEC_ENV_OLS

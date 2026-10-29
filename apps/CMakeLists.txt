@@ -40,3 +40,30 @@ if (NOT MSVC)
             RUNTIME
     )
 endif()
+
+add_executable(search_io_opportunity search_io_opportunity.cpp)
+target_link_libraries(search_io_opportunity ${PROJECT_NAME} ${DISKANN_ASYNC_LIB} ${DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS} Boost::program_options)
+
+add_executable(collect_io_labels collect_io_labels.cpp)
+target_link_libraries(collect_io_labels ${PROJECT_NAME} ${DISKANN_ASYNC_LIB} ${DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS} Boost::program_options)
+
+add_executable(search_delay_diagnosis search_delay_diagnosis.cpp)
+target_link_libraries(search_delay_diagnosis ${PROJECT_NAME} ${DISKANN_ASYNC_LIB} ${DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS} Boost::program_options)
+
+add_executable(search_ram_navigation search_ram_navigation.cpp)
+target_link_libraries(search_ram_navigation ${PROJECT_NAME} ${DISKANN_ASYNC_LIB} ${DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS} Boost::program_options)
+
+add_executable(search_ram_entry_diagnosis search_ram_entry_diagnosis.cpp)
+target_link_libraries(search_ram_entry_diagnosis ${PROJECT_NAME} ${DISKANN_ASYNC_LIB} ${DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS} Boost::program_options)
+
+add_executable(search_ram_bottom_entry_diagnosis search_ram_bottom_entry_diagnosis.cpp)
+target_link_libraries(search_ram_bottom_entry_diagnosis ${PROJECT_NAME} ${DISKANN_ASYNC_LIB} ${DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS} Boost::program_options)
+
+add_executable(collect_history_labels collect_history_labels.cpp)
+target_link_libraries(collect_history_labels ${PROJECT_NAME} ${DISKANN_ASYNC_LIB} ${DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS} Boost::program_options)
+
+add_executable(search_query_skip_cache search_query_skip_cache.cpp)
+target_link_libraries(search_query_skip_cache ${PROJECT_NAME} ${DISKANN_ASYNC_LIB} ${DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS} Boost::program_options)
+
+add_executable(search_policy_comparison search_policy_comparison.cpp)
+target_link_libraries(search_policy_comparison ${PROJECT_NAME} ${DISKANN_ASYNC_LIB} ${DISKANN_TOOLS_TCMALLOC_LINK_OPTIONS} Boost::program_options)
