@@ -26,6 +26,10 @@ class OnlineGate {
         if(!f) throw std::runtime_error("Truncated online MLP file");
     }
 public:
+    bool forest_model=false;
+    struct ForestNode { int left,right,feature; float value; };
+    std::vector<std::vector<ForestNode>> forest;
+    float forest_bias=0;
     float threshold=0;
     bool uses_vector_features() const { return !state_only; }
     uint32_t query_feature_width() const { return query_width; }
@@ -33,6 +37,13 @@ public:
         std::ifstream f(model,std::ios::binary); char magic[8]; f.read(magic,8);
         if(!f) throw std::runtime_error("Cannot read online gate model");
         const std::string model_magic(magic,8);
+        if(model_magic=="XGGATE01") {
+            forest_model=true;state_only=true;uint32_t nt;
+            f.read(reinterpret_cast<char*>(&forest_bias),4);f.read(reinterpret_cast<char*>(&nt),4);
+            if(nt>10000)throw std::runtime_error("Invalid forest");
+            forest.resize(nt);for(auto& t:forest){uint32_t nn;f.read(reinterpret_cast<char*>(&nn),4);if(nn>100000)throw std::runtime_error("Invalid tree");t.resize(nn);f.read(reinterpret_cast<char*>(t.data()),nn*sizeof(ForestNode));}
+            if(!f)throw std::runtime_error("Truncated forest");return;
+        }
         if(model_magic=="LRGATE01" || model_magic=="TRGATE01" || model_magic=="HLGATE01") {
             history_model=model_magic=="HLGATE01";
             linear_model=model_magic=="LRGATE01" || history_model;tree_model=!linear_model;state_only=true;
@@ -77,6 +88,12 @@ public:
         mkl_set_num_threads_local(1);
     }
     float score(const float* q,uint32_t node,const float* state) const {
+        if(forest_model) {
+            if(state[10]!=0)return 1;
+            float z=forest_bias;
+            for(const auto& t:forest){int i=0;while(t[i].left>=0)i=state[t[i].feature]<t[i].value?t[i].left:t[i].right;z+=t[i].value;}
+            return 1.0f/(1.0f+std::exp(-z));
+        }
         if(linear_model || tree_model) {
             // This experiment targets cache misses; keep all cached candidates.
             if(state[10]!=0)return 1;
