@@ -1,0 +1,37 @@
+#define main ram_navigation_original_main
+#include "search_ram_navigation.cpp"
+#undef main
+struct Trial {unsigned hits=0,ios=0,expanded=0;double us=0;std::array<uint64_t,10> result{};};
+int main(int argc,char**argv){
+ if(argc!=7)throw std::runtime_error("index graph query gt output count");
+ std::shared_ptr<AlignedFileReader>reader(new LinuxAlignedFileReader());diskann::PQFlashIndex<float,uint32_t>index(reader,diskann::Metric::L2);if(index.load(4,argv[1]))return 3;
+ NavGraph graph=read_graph(argv[2]);index.load_cache_list(graph.ids);float*queries=nullptr;size_t nq,dim,adim;diskann::load_aligned_bin<float>(argv[3],queries,nq,dim,adim);uint32_t*truth=nullptr;float*gd=nullptr;size_t ng,dg;diskann::load_truthset(argv[4],truth,gd,ng,dg);if(ng!=nq||dg<10)throw std::runtime_error("GT");
+ std::array<NavScratch,4>scratch;for(auto&s:scratch){s.visited.resize(graph.ids.size());s.queue.reserve(64);s.best.reserve(5);s.seeds.reserve(4);}
+ const size_t count=std::min(nq,size_t(std::stoul(argv[6])));std::vector<std::string> summaries(count),candidates(count),entries(count);
+ auto wall=std::chrono::steady_clock::now();
+ #pragma omp parallel for schedule(dynamic,1) num_threads(4)
+ for(size_t row=0;row<count;++row){mkl_set_num_threads_local(1);const float*q=queries+row*adim;auto&s=scratch[omp_get_thread_num()];std::vector<uint32_t>path;auto nav=navigate(index,q,graph,s,64,&path);auto current=s.seeds;
+  auto trial=[&](const std::vector<uint32_t>&seeds){Trial t;diskann::QueryStats st{};std::array<float,10>dd{};diskann::ram_entry_seeds=&seeds;auto start=std::chrono::steady_clock::now();index.cached_beam_search(q,10,100,t.result.data(),dd.data(),4,UINT32_MAX,false,&st);diskann::ram_entry_seeds=nullptr;t.us=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-start).count();t.ios=st.n_ios;t.expanded=st.n_expanded;for(auto id:t.result)for(unsigned j=0;j<10;++j)if(id==truth[row*dg+j]){++t.hits;break;}return t;};
+  auto baseline=trial({});auto actual=trial(current);auto selection_start=std::chrono::steady_clock::now();std::vector<std::pair<float,uint32_t>> all;all.reserve(graph.ids.size());
+  for(uint32_t slot=0;slot<graph.ids.size();++slot){float d=0;auto*p=index.cached_coordinates(graph.ids[slot]);for(unsigned j=0;j<dim;++j){float a=q[j]-p[j];d+=a*a;}all.emplace_back(d,slot);}std::sort(all.begin(),all.end());double scan_us=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-selection_start).count();
+  std::vector<uint32_t>global4,discovered4;std::vector<unsigned> rank(graph.ids.size());for(unsigned i=0;i<all.size();++i){rank[all[i].second]=i+1;if(global4.size()<4)global4.push_back(graph.ids[all[i].second]);if(s.visited[all[i].second]&&discovered4.size()<4)discovered4.push_back(graph.ids[all[i].second]);}
+  auto global_trial=trial(global4);auto discovered_trial=trial(discovered4);
+  std::set<uint32_t>expanded(path.begin(),path.end());std::set<uint32_t>pool=expanded;for(unsigned j=0;j<std::min(size_t(32),all.size());++j)pool.insert(all[j].second);
+  struct Candidate{uint32_t slot;Trial value;};std::vector<Candidate> scored;std::ostringstream c,e,r;unsigned value_in_current=0,value_in_expanded=0,value_only_outside=0;
+  auto better=[&](const Trial&a,const Trial&b){return a.hits>=actual.hits&&(b.hits<actual.hits||a.ios<b.ios||(a.ios==b.ios&&a.hits>b.hits));};
+  Trial oracle_expanded=actual,oracle_pool=actual;std::vector<uint32_t>expanded_seeds=current,pool_seeds=current;uint64_t cf_requests=0;unsigned cf_searches=0;
+  for(auto slot:pool){auto t=trial({graph.ids[slot]});cf_requests+=t.ios;++cf_searches;scored.push_back({slot,t});bool safe=t.hits>=actual.hits;bool useful=safe&&t.ios<actual.ios;bool selected=std::find(current.begin(),current.end(),graph.ids[slot])!=current.end();if(useful){if(selected)++value_in_current;if(expanded.count(slot))++value_in_expanded;else ++value_only_outside;}
+   if(expanded.count(slot)&&better(t,oracle_expanded)){oracle_expanded=t;expanded_seeds={graph.ids[slot]};}if(better(t,oracle_pool)){oracle_pool=t;pool_seeds={graph.ids[slot]};}
+   c<<row<<','<<graph.ids[slot]<<','<<rank[slot]<<','<<expanded.count(slot)<<','<<unsigned(s.visited[slot])<<','<<selected<<','<<t.hits<<','<<t.ios<<','<<actual.hits<<','<<actual.ios<<','<<safe<<','<<useful<<'\n';
+  }
+  std::sort(scored.begin(),scored.end(),[&](const Candidate&a,const Candidate&b){bool sa=a.value.hits>=actual.hits,sb=b.value.hits>=actual.hits;if(sa!=sb)return sa>sb;if(a.value.ios!=b.value.ios)return a.value.ios<b.value.ios;if(a.value.hits!=b.value.hits)return a.value.hits>b.value.hits;return a.slot<b.slot;});
+  auto greedy=[&](bool only_expanded){std::vector<uint32_t>shortlist,combo;Trial optimum=actual;std::vector<uint32_t> optimum_seeds=current;for(auto&c:scored){if(!only_expanded||expanded.count(c.slot))shortlist.push_back(graph.ids[c.slot]);if(shortlist.size()==8)break;}
+   for(unsigned step=0;step<4;++step){bool found=false;Trial best;uint32_t chosen=UINT32_MAX;for(auto id:shortlist){if(std::find(combo.begin(),combo.end(),id)!=combo.end())continue;auto proposed=combo;proposed.push_back(id);auto t=trial(proposed);cf_requests+=t.ios;++cf_searches;if(t.hits>=actual.hits&&(!found||t.ios<best.ios||(t.ios==best.ios&&t.hits>best.hits))){best=t;chosen=id;found=true;}}if(!found)break;combo.push_back(chosen);if(combo.size()==4&&better(best,optimum)){optimum=best;optimum_seeds=combo;}}
+   return std::make_pair(optimum,optimum_seeds);};
+  auto oracle4=greedy(false);auto expanded4=greedy(true);if(better(expanded4.first,oracle4.first))oracle4=expanded4;
+  auto emit=[&](const char*method,const Trial&t,const std::vector<uint32_t>&seeds,double extra){auto a=t.result,b=actual.result;std::sort(a.begin(),a.end());std::sort(b.begin(),b.end());r<<row<<','<<method<<','<<t.hits<<','<<t.ios<<','<<t.expanded<<','<<t.us<<','<<nav.us<<','<<extra<<','<<(a==b)<<','<<seeds.size()<<'\n';for(unsigned j=0;j<seeds.size();++j)e<<row<<','<<method<<','<<j<<','<<seeds[j]<<'\n';};
+  emit("no_navigation",baseline,{},0);emit("current4",actual,current,0);emit("discovered4",discovered_trial,discovered4,0);emit("cache_nearest4",global_trial,global4,scan_us);emit("oracle_expanded_single",oracle_expanded,expanded_seeds,0);emit("oracle_pool_single",oracle_pool,pool_seeds,0);emit("oracle_pool4",oracle4.first,oracle4.second,0);emit("oracle_expanded4",expanded4.first,expanded4.second,0);
+  r<<row<<",diagnostic_cost,0,"<<cf_requests<<','<<cf_searches<<",0,"<<nav.us<<','<<scan_us<<",0,0\n";summaries[row]=r.str();candidates[row]=c.str();entries[row]=e.str();
+ }
+ std::ofstream f(std::string(argv[5])+".csv");f<<"query,method,hits,submitted_requests,expansions,backend_us,nav_us,selection_us,strict_same_results,seed_count\n";std::ofstream c(std::string(argv[5])+".candidates.csv");c<<"query,node,cache_distance_rank,expanded,discovered,selected,hits,submitted_requests,current_hits,current_requests,recall_safe,valuable\n";std::ofstream e(std::string(argv[5])+".entries.csv");e<<"query,method,position,node\n";for(size_t i=0;i<count;++i){f<<summaries[i];c<<candidates[i];e<<entries[i];}std::ofstream m(std::string(argv[5])+".meta.json");m<<"{\"queries\":"<<count<<",\"wall_seconds\":"<<std::chrono::duration<double>(std::chrono::steady_clock::now()-wall).count()<<",\"candidate_pool\":\"64 RAM expansions union 32 exact nearest cached nodes\",\"oracle_selection_cost_excluded\":true}\n";diskann::aligned_free(queries);delete[]truth;delete[]gd;
+}
